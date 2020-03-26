@@ -1,0 +1,301 @@
+## R Draw Broad GSEA Analysis Results
+##Define data import functions
+```{r}
+suppressMessages(require(xml2))
+suppressMessages(require(dplyr))
+suppressMessages(library(stringr))
+
+importRank<-function(GSEA_output_dir,rank_file_name){
+  rank_file <- paste0(GSEA_output_dir,paste0("/edb/",rank_file_name))
+  rank <- read.table(rank_file, row.names=NULL, sep="\t", header=F, quote="")
+  colnames(rank) <- c("Gene","Rank")
+  rank <- data.frame(x=1:nrow(rank), rank)
+  rank[,c("position","ymin","ymax","ES")] = 0
+  return(rank)
+}
+
+enrichset<-gseaEnrichTable[1,]
+mergeRank <- function(rank, enrichset) {
+    rank2<-rank
+    hitIndices <- as.numeric(str_split(enrichset["HIT_INDICES"]," ",simplify=T))
+    hitIndices <- hitIndices + 1
+    esProfile <- as.numeric(str_split(enrichset["ES_PROFILE"]," ",simplify=T))
+    gsea_result <- data.frame(hitIndices=hitIndices, esProfile=esProfile)
+    rank2$position[gsea_result$hitIndice] = 1
+    # Add ES
+    rank2$ES <- gsea_result[match(rank$x, gsea_result$hitIndices), 2]
+    # Add Y
+    rank2[rank2$position==1,"ymin"] <- -0.2
+    rank2[rank2$position==1,"ymax"] <- 0.2
+    rank2$Description <- enrichset["GENESET"]
+    return(rank2)
+}
+
+# This sentences defines the function for importing GSEA data and requires the GSEA output result directory/rank_file file name
+importGSEA <- function (GSEA_output_dir,rank,NES_abs=1,NP=0.05,FDR=1,type=c("all")) {
+  type <- match.arg(type, c("all","pos","neg"))
+  xml_file <- paste0(GSEA_output_dir, "/edb/results.edb")
+  data <- read_xml(xml_file)
+  recs <- xml_find_all(data, "//DTG")
+  attrs = recs %>% xml_attrs()
+  gseaEnrichTable = as.data.frame(do.call(rbind, attrs))
+  gseaEnrichTable$GENESET <- stringr::str_split(gseaEnrichTable$GENESET, "#", simplify=T)[,2]
+  gseaEnrichTable$GENESET<-sub("_",": ",gseaEnrichTable$GENESET)
+  gseaEnrichTable$GENESET<-gsub("_"," ",gseaEnrichTable$GENESET)
+  gseaEnrichTable$GENESET<-tolower(gseaEnrichTable$GENESET)
+  gseaEnrichTable$GENESET<-gsub("dna","DNA",gseaEnrichTable$GENESET)
+  gseaEnrichTable$GENESET<-gsub("rna","RNA",gseaEnrichTable$GENESET)
+  gseaEnrichTable$GENESET<-sub("go: ","GO: ",gseaEnrichTable$GENESET)
+  gseaEnrichTable$GENESET<-sub("kegg: ","KEGG: ",gseaEnrichTable$GENESET)
+  gseaEnrichTable <- gseaEnrichTable[,-(1:2)]
+  gseaEnrichTable[,c(2,3,4,5,6,10,11)] <- lapply(gseaEnrichTable[,c(2,3,4,5,6,10,11)], function(x) {
+        if(is.factor(x)) as.numeric(as.character(x)) else x })
+  for(i in 1: nrow(gseaEnrichTable)){
+    if(gseaEnrichTable$NP[i]<0.001) 
+      gseaEnrichTable$GENESET[i] <-paste0(gseaEnrichTable$GENESET[i],"***")
+    else if(gseaEnrichTable$NP[i]<0.01)
+      gseaEnrichTable$GENESET[i] <-paste0(gseaEnrichTable$GENESET[i],"**")
+    else if (gseaEnrichTable$NP[i]<0.05)
+      gseaEnrichTable$GENESET[i] <-paste0(gseaEnrichTable$GENESET[i],"*")
+  }
+  gseaEnrichTable <- gseaEnrichTable[order(abs(gseaEnrichTable$NES), decreasing = T),]
+  gseaEnrichTable <- gseaEnrichTable[abs(gseaEnrichTable$NES)>NES_abs&gseaEnrichTable$NP<NP&gseaEnrichTable$FDR<=FDR,]
+  ifelse(type=="all",gseaEnrichTable<-gseaEnrichTable,
+         ifelse(type=="pos",
+                gseaEnrichTable<-gseaEnrichTable[gseaEnrichTable$NES>0,],
+                gseaEnrichTable<-gseaEnrichTable[gseaEnrichTable$NES<0,]))
+  mergedResult <- do.call(rbind, apply(gseaEnrichTable, 1, mergeRank, rank=rank))
+  gseaEnrichObject <- list(GSEAprofile=mergedResult, gseaEnrichTable = gseaEnrichTable)
+  return(gseaEnrichObject)
+}
+```
+##Defining drawing functions
+```{r}
+library(ggplot2)
+library(RColorBrewer)
+library(gridExtra)
+library(ggpubr)
+gsInfo3 <- function(x, gseaEnrichTable, geneSetID){
+  # Get term name if indexes give
+  # Index sort by absolute NES
+  if (is.numeric(geneSetID)) {
+    geneSetID <- gseaEnrichTable[geneSetID, "GENESET"]
+  }
+  # Return a subset of data
+  return(x[x$Description==geneSetID,])
+}
+
+statInfo <- function(gseaEnrichTable, geneSetID,FDR=F){
+   if (is.numeric(geneSetID)) {
+      geneSetID <- gseaEnrichTable[geneSetID, "GENESET"]
+   }
+  ifelse(FDR,return(gseaEnrichTable[gseaEnrichTable$GENESET==geneSetID, c("GENESET", "NES","NP","FDR")]),
+             return(gseaEnrichTable[gseaEnrichTable$GENESET==geneSetID, c("GENESET", "NES","NP")])
+    )
+}
+
+tableGrob3 <- function(d, p=NULL,ann_color = F, base_size=12,ann_base_size_ratio=1) {
+    changeTheme <- gridExtra::ttheme_default(
+      core = list(fg_params=list(fontsize = base_size*ann_base_size_ratio)),
+      colhead = list(fg_params=list(fontsize=base_size*ann_base_size_ratio)),
+      rowhead = list(fg_params=list(fontsize=base_size*ann_base_size_ratio)))
+    tp <- gridExtra::tableGrob(d, theme=changeTheme)
+    if (!ann_color) {
+        return(tp)
+    }
+     pcol <- unique(ggplot_build(p)$data[[1]][["colour"]])
+     j <- which(tp$layout$name == "rowhead-fg")
+     for (i in seq_along(pcol)) {
+         tp$grobs[j][[i+1]][["gp"]] = grid::gpar(col = pcol[i], 
+                                                 fontsize=base_size*ann_base_size_ratio)
+     }
+    return(tp)
+}
+gseaPlot3 <- function(GSEAenrichObject=gseaEnrichObject_pos, 
+                      geneSetID=1:5,
+                      title = NULL,
+                      color="black",
+                      base_size = 12,#base font size
+                      rel_heights=c(1.5, .5, 1), #Image scale
+                      subplots = 1:3, 
+                      p1_legend_x=0.6,p1_legend_y=0.6,
+                      pvalue_table = T, 
+                      FDR=F,
+            ann_x_min=0.4,ann_x_max=0.9,ann_y_min=0.75,ann_y_max=0.9,
+                      ann_base_size_ratio=1,
+                      ann_color=T,
+                      ES_geom="line") {
+  x <- GSEAenrichObject$GSEAprofile
+  gseaEnrichTable <- GSEAenrichObject$gseaEnrichTable
+  ES_geom <- match.arg(ES_geom, c("line", "dot"))
+  
+  ifelse(max(geneSetID)<=nrow(GSEAenrichObject$gseaEnrichTable),
+         geneSetID<-geneSetID,
+         geneSetID<-1:nrow(GSEAenrichObject$gseaEnrichTable))
+  if (length(geneSetID)== 1) {
+    gsdata <- gsInfo3(x, gseaEnrichTable, geneSetID)
+  } else {
+    gsdata <- do.call(rbind, 
+                      lapply(geneSetID, 
+                             gsInfo3, 
+                             x=x, 
+                             gseaEnrichTable = gseaEnrichTable))
+  }
+  p <- ggplot(gsdata, aes_(x = ~x)) + xlab(NULL) +
+    theme_classic(base_size) +
+    theme(panel.grid.major = element_line(colour = "grey92"),
+          panel.grid.minor = element_line(colour = "grey92"),
+          panel.grid.major.y = element_blank(),
+          panel.grid.minor.y = element_blank()) +
+    scale_x_continuous(expand=c(0,0))
+  # Running ES line or point
+  # Different enriched terms plot separately
+  if (ES_geom == "line") {
+    es_layer <- geom_line(aes_(y = ~ES, color= ~Description), size=1, 
+                          data = subset(gsdata, position == 1))
+  } else {
+    es_layer <- geom_point(aes_(y = ~ES, color= ~Description), size=1, 
+                           data = subset(gsdata, position == 1))
+  }
+  p.res <- p + es_layer +
+    theme(legend.position = c(p1_legend_x,p1_legend_y), legend.title = element_blank(),
+          legend.background = element_rect(fill = "transparent"))
+  p.res <- p.res + ylab("ES") +
+    theme(axis.text.x=element_blank(),
+          axis.ticks.x=element_blank(),
+          axis.line.x=element_blank(),
+          plot.margin=margin(t=.2, r = .2, b=0, l=.2, unit="cm"))
+  # Generate data for exist line or position line
+  i <- 0
+  for (term in unique(gsdata$Description)) {
+    idx <- which(gsdata$ymin != 0 & gsdata$Description == term)
+    gsdata[idx, "ymin"] <- i
+    gsdata[idx, "ymax"] <- i + 1
+    i <- i + 1
+  }
+  # Plot exist line or position line
+  p2 <- ggplot(gsdata, aes_(x =~x)) +
+    geom_linerange(aes_(ymin=~ymin, ymax=~ymax, color=~Description)) +
+    xlab(NULL) + ylab(NULL) + theme_classic(base_size) +
+    theme(legend.position = "none",
+          plot.margin = margin(t=-.1, b=0,unit="cm"),
+          axis.ticks = element_blank(),
+          axis.text = element_blank(),
+          axis.line.x = element_blank()) +
+    scale_x_continuous(expand=c(0,0)) +
+    scale_y_continuous(expand=c(0,0))
+  
+  if (length(geneSetID) == 1) {
+  #This section did not find the explanation corresponding to GSEA, the results obtained by this processing and GSEA is not completely consistent, just for references
+    v <- seq(1, sum(gsdata$position), length.out=9)
+    inv <- findInterval(rev(cumsum(gsdata$position)), v)
+    if (min(inv) == 0) inv <- inv + 1
+    col=c(rev(brewer.pal(5, "Blues")), brewer.pal(5, "Reds"))
+    ymin <- min(p2$data$ymin)
+    yy <- max(p2$data$ymax - p2$data$ymin) * .3
+    xmin <- which(!duplicated(inv))
+    xmax <- xmin + as.numeric(table(inv)[unique(inv)])
+    d <- data.frame(ymin = ymin, 
+                    ymax = yy,
+                    xmin = xmin,
+                    xmax = xmax,
+                    col = col[unique(inv)])
+    p2 <- p2 + geom_rect(
+      aes_(xmin=~xmin,
+           xmax=~xmax,
+           ymin=~ymin,
+           ymax=~ymax,
+           fill=~I(col)),
+      data=d,
+      alpha=.9,
+      inherit.aes=FALSE)
+  } else {
+    # If you draw multiple collections at the same time, the rank value makes a heatmap
+    ymin <- min(p2$data$ymin)-0.3
+    yy <- max(p2$data$ymax - p2$data$ymin) * .4
+    p2 <- p2 +
+      geom_rect(aes(xmin=x-.5, xmax=x+.5, fill=Rank),ymin=ymin, ymax = ymin+yy, alpha=0.5)+
+      theme(legend.position="none") +
+      scale_fill_gradient2(low="blue", mid="white", high="red", midpoint=0)
+  }
+  
+  # Rank value
+  df2 <- p$data #data.frame(x = which(p$data$position == 1))
+  df2$y <- p$data$Rank[df2$x]
+  df2$y[df2$y==0] = 0.0001
+  p.pos <- p + geom_segment(data=df2, aes_(x=~x, xend=~x, y=~y, yend=0), color="grey")
+  p.pos <- p.pos + ylab("Ranked list")+
+    xlab("Rank in Ordered Dataset") +
+    theme(plot.margin=margin(t = -.1, r = .2, b=.2, l=.2, unit="cm"))
+  if (!is.null(title) && !is.na(title) && title != "")
+    p.res <- p.res + ggtitle(title)
+  if (length(color) == length(geneSetID)) {
+    p.res <- p.res + scale_color_manual(values=color)
+    if (length(color) == 1) {
+      p2 <- p2 + scale_color_manual(values = color)
+    } else {
+      p2 <- p2 + scale_color_manual(values = color)
+    }
+  }
+  
+  if (pvalue_table) {
+    if (length(geneSetID) == 1) {
+      pd <- statInfo(gseaEnrichTable, geneSetID)
+    } else {
+      pd <- do.call(rbind, lapply(geneSetID, statInfo, gseaEnrichTable = gseaEnrichTable,FDR=F))
+    }
+    rownames(pd) <- pd$GENESET
+    pd <- pd[,-1]
+    pd <- round(pd, 4)
+    pd<-data.frame(GENESET=rownames(pd),pd)
+    tp <- ggplotGrob(ggtexttable(pd, rows = NULL))
+    #tp <- tableGrob3(pd, p.res,ann_color,base_size,ann_base_size_ratio)
+    p.res <- p.res + 
+      theme(legend.position = "none") +
+      annotation_custom(tp,
+                        xmin = quantile(p.res$data$x, ann_x_min),
+                        xmax = quantile(p.res$data$x, ann_x_max),
+                        ymin = quantile(p.res$data$ES, ann_y_min, na.rm=T),
+                        ymax = quantile(p.res$data$ES, ann_y_max, na.rm=T)) 
+  }
+  plotlist <- list(p.res, p2, p.pos)[subplots]
+  n <- length(plotlist)
+  if(!length(subplots)==2) 
+    plotlist[[n]] <- plotlist[[n]] +
+    theme(axis.line.x = element_line(),
+          axis.ticks.x=element_line(),
+          axis.text.x = element_text())
+  if (length(subplots) == 1)
+    return(plotlist[[1]] + theme(plot.margin=margin(t=.2, r = .2, b=.2, l=.2, unit="cm")))
+  if (length(rel_heights) > length(subplots))
+    rel_heights <- rel_heights[subplots]
+  cowplot::plot_grid(plotlist = plotlist, ncol=1, align="v", rel_heights=rel_heights)
+}
+```
+## Import data
+```{r}
+suppressMessages(require(xml2))
+suppressMessages(require(dplyr))
+suppressMessages(library(stringr))
+
+GSEA_output_dir<-"my_analysis.Gsea.1584183234138.go.batch_removed"
+rank_file_name<-"DESeq2_batch_removed.gsea_group.cls_OA_versus_Norm.rnk"
+# GSEA_output_dir<-"./my_analysis.Gsea.1584180112674.kegg.batch_removed"
+# rank_file_name<-"DESeq2.gsea_group.cls_OA_versus_Norm.rnk"
+rank<-importRank(GSEA_output_dir,rank_file_name)
+gseaEnrichObject_pos  <- importGSEA(GSEA_output_dir,rank,NES_abs=1,NP=0.05,FDR=1,type = "pos")
+gseaEnrichObject_neg  <- importGSEA(GSEA_output_dir,rank,NES_abs=1,NP=0.05,FDR=1,type = "neg")
+```
+##Draw plot
+```{r}
+library(ggplot2)
+library(RColorBrewer)
+p_pos<-gseaPlot3(gseaEnrichObject_pos, 1:5, pvalue_table =F, p1_legend_x = 0.25,p1_legend_y = 0.45)
+p_neg<-gseaPlot3(gseaEnrichObject_neg, 1:5, pvalue_table = F,p1_legend_x = 0.32,p1_legend_y = 0.47)
+```
+```{r}
+p_pos
+```
+```{r}
+p_neg
+```
