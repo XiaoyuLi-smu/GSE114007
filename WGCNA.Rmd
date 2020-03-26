@@ -1,0 +1,533 @@
+## WGCNA Analysis
+## Initialize the input file
+```{r}
+# Format as described earlier：general expression matrix, after log2 conversion or varianceStabilizingTransformation of DESeq2
+# If there is a batch effect that needs to be removed in advance, use removeBatchEffect
+# If there is a system offset (boxplot can be used to see if gene expression distribution is consistent) quantile normalization is needed.
+exprMat <- "DESeq2.normalized.rlog_batch_removed.txt"
+# If not, set to empty
+trait <- "wgcna_trait.txt"
+
+```
+## Load package, read into expression matrix, filter missing values
+```{r}
+library(WGCNA)
+library(reshape2)
+library(stringr)
+options(stringsAsFactors = FALSE)
+# Open multithreaded
+enableWGCNAThreads()
+
+# Officially recommended "signed" or "signed hybrid" 
+# signed-obtained modules contain fewer genes
+type = "signed"
+
+# Relevance calculation
+# Official recommendation is biweight mid-correlation & bicor
+# corType: pearson or bicor
+corType = "bicor"
+
+corFnc = ifelse(corType=="pearson", cor, bicor)
+# When calculating correlations for binary variables, such as sample trait information, or when the expression of a gene is heavily dependent on the disease state, the following parameters need to be set
+maxPOutliers = ifelse(corType=="pearson",1,0.05)
+
+# When the binary variable of the sample trait is associated, set
+robustY = ifelse(corType=="pearson",T,F)
+```
+##Import data##
+```{r}
+dataExpr <- read.table(exprMat, sep='\t', row.names=1, header=T,quote="", comment="", check.names=F)
+dim(dataExpr)
+head(dataExpr)[,1:8]
+```
+```{r}
+## Screening the first 75% of genes for median absolute deviation, at least MAD greater than 0.01
+## Filtering reduces the amount of computation and also loses some of the information. 
+## You may not do filtering, as long as  that MAD is greater than 0.
+m.mad <- apply(dataExpr,1,mad)
+dataExprVar <- dataExpr[which(m.mad > 
+                 max(quantile(m.mad, probs=seq(0, 1, 0.25))[2],0.01)),]
+
+## Convert to sample in row, gene in column matrix
+dataExpr <- as.data.frame(t(dataExprVar))
+
+## Detecting missing values
+gsg = goodSamplesGenes(dataExpr, verbose = 3)
+if (!gsg$allOK){
+  # Optionally, print the gene and sample names that were removed:
+  if (sum(!gsg$goodGenes)>0) 
+    printFlush(paste("Removing genes:", 
+                     paste(names(dataExpr)[!gsg$goodGenes], collapse = ",")));
+  if (sum(!gsg$goodSamples)>0) 
+    printFlush(paste("Removing samples:", 
+                     paste(rownames(dataExpr)[!gsg$goodSamples], collapse = ",")));
+  # Remove the offending genes and samples from the data:
+  dataExpr = dataExpr[gsg$goodSamples, gsg$goodGenes]
+}
+
+nGenes = ncol(dataExpr)
+nSamples = nrow(dataExpr)
+```
+```{r}
+dim(dataExpr)
+head(dataExpr)[,1:8]
+```
+
+## Sample hierarchy clustering to see if there are outliers
+
+```{r}
+sampleTree = hclust(dist(dataExpr), method = "average")
+plot(sampleTree, main = "Sample clustering to detect outliers", sub="", xlab="")
+```
+## Sample hierarchy clustering and detecting outliers
+```{r}
+# sample network based on squared Euclidean distance note that we transpose the data
+A = adjacency(t(dataExpr), type = "distance")
+# this calculates the whole network connectivity
+k = as.numeric(apply(A, 2, sum)) - 1
+# standardized connectivity
+Z.k = scale(k)
+# Designate samples as outlying if their Z.k value is below the threshold
+thresholdZ.k = -2.5  # often -2.5
+# the color vector indicates outlyingness (red)
+outlierColor = ifelse(Z.k < thresholdZ.k, "red", "black")
+# calculate the cluster tree using flahsClust or hclust
+sampleTree = hclust(as.dist(1 - A), method = "average")
+# Convert traits to a color representation: where red indicates high values
+plotDendroAndColors(sampleTree, 
+                    colors = outlierColor, 
+                    groupLabels = "Outlyingness",
+                    main = "Original sample dendrogram and outlyingness heatmap")
+remove.samples= Z.k<thresholdZ.k | is.na(Z.k)
+```
+##Rule out all the ouliers
+```{r}
+while(!all(remove.samples==F)){
+# Convert traits to a color representation: where red indicates high values
+# Plot the sample dendrogram and the colors underneath.
+  plotDendroAndColors(sampleTree, 
+                    colors = outlierColor, 
+                    groupLabels = "Outlyingness",
+                    main = "Sample dendrogram and outlyingness heatmap")
+  # sample network based on squared Euclidean distance note that we transpose the data
+  dataExpr=dataExpr[!remove.samples,]
+  A = adjacency(t(dataExpr), type = "distance")
+# this calculates the whole network connectivity
+  k = as.numeric(apply(A, 2, sum)) - 1
+# standardized connectivity
+  Z.k = scale(k)
+# Designate samples as outlying if their Z.k value is below the threshold
+  thresholdZ.k = -2.5  # often -2.5
+
+# the color vector indicates outlyingness (red)
+  outlierColor = ifelse(Z.k < thresholdZ.k, "red", "black")
+#outlierColor_rownames<-plyr::revalue(outlierColor,c(black="normal",red="outlier"))
+
+# calculate the cluster tree using flahsClust or hclust
+  sampleTree = hclust(as.dist(1 - A), method = "average")
+  remove.samples= Z.k<thresholdZ.k | is.na(Z.k)
+}
+```
+
+## Determine a soft threshold
+```{r}
+## The filtering principle of soft thresholds is to make the network built more in line with the scaleless network characteristics
+powers = c(c(1:10), seq(from = 12, to=30, by=2))
+sft = pickSoftThreshold(dataExpr, 
+                        powerVector=powers, 
+                        networkType=type, 
+                        verbose=5)
+
+par(mfrow = c(1,2))
+cex1 = 0.9
+# The horizontal axis is Soft threshold, the vertical axis is the evaluation parameter of the scaleless network, the higher the value, the more the network conforms to the non-scale characteristic (non-scale)
+plot(sft$fitIndices[,1],
+     -sign(sft$fitIndices[,3])*sft$fitIndices[,2],
+     xlab="Soft Threshold (power)",
+     ylab=expression("Scale Free Topology Model Fit,signed R"^2),
+     type="n",
+     main = paste("Scale independence"))
+text(sft$fitIndices[,1], -sign(sft$fitIndices[,3])*sft$fitIndices[,2],
+     labels=powers,cex=cex1,col="red")
+# Screening criteria. R-square=0.85
+abline(h=0.85,col="red")
+```
+```{r}
+# Soft threshold with average connectivity
+plot(sft$fitIndices[,1], sft$fitIndices[,5],
+     xlab="Soft Threshold (power)",ylab="Mean Connectivity", type="n",
+     main = paste("Mean connectivity"))
+text(sft$fitIndices[,1], sft$fitIndices[,5], labels=powers, 
+     cex=cex1, col="red")
+```
+```{r}
+power = sft$powerEstimate
+power
+#The power should be less than 15 in the non-directional networkwithin 30 in the  directional network to make the scaleless network map structure R^2 to 0.8 and the average connection higher than 100. If not,it may be due to some samples and other samples are too different. This may be caused by batch effects, sample heterogeneity, or experimental conditions that have too much effect on expression. You can view grouping information and presence of abnormal samples by drawing sample clusters. 
+# If this is indeed caused by meaningful biological changes, you can also use the following experience power values.
+
+if (is.na(power)){
+  print("Using experience power since no suitable power found.")
+  power = ifelse(nSamples<20, ifelse(type == "unsigned", 9, 18),
+          ifelse(nSamples<30, ifelse(type == "unsigned", 8, 16),
+          ifelse(nSamples<40, ifelse(type == "unsigned", 7, 14),
+          ifelse(type == "unsigned", 6, 12))       
+          )
+          )
+}
+
+print(paste("Finally chooosed power is :", power))
+
+```
+
+## Build a co-expression network
+
+```{r}
+# power: soft threshold calculated on the previous steps
+# maxBlockSize: number of genes for the maximum module that a computer can process (default 5000). Genes are best placed in a block if computing resources allowed
+#An article about the blockwise analysis is posted at http://www.peterlangfelder.com/blockwise-network-analysis-of-large-data/,here's a quote:
+# I emphasize that the blockwise analysis creates an approximation to the  network that would result from a single block analysis. The approximation is often very good but the modules are not quite the same. If possible, I recommend running the analysis in a single block; if not, use the largest blocks your computer can handle. "
+# corType: pearson or bicor
+# numericLabels: returns numbers instead of colors as the name of the module, which can be converted to color later
+# saveTOMs：the most time-consuming calculation, stored for subsequent use
+# mergeCutHeight: the greater the threshold for merging modules, the larger the number of modules, the larger the number of modules, the greater the redundancy, typically between 0.15-0.3
+# loadTOMs: avoid double counting
+
+net = blockwiseModules(dataExpr, 
+                       power = power, 
+                       maxBlockSize = nGenes,
+                       #minModuleSize = 25,
+                       corType=corType,
+                       networkType = type,
+                       TOMType = type,
+                       mergeCutHeight = 0.2,
+                       stabilityCriterion = "Individual fraction",
+                       #deepSplit = 1,
+                       #reassignThreshold = 0,
+                       #pamRespectsDendro = FALSE,
+                       numericLabels = TRUE,
+                       saveTOMs=TRUE, 
+                       loadTOM=F,
+                       saveTOMFileBase = paste0(exprMat, ".tom"),
+                       verbose = 3)
+
+
+# According to the number of genes in the module, the descending order is numbered 1 to maximum number of modules.
+# 0 (grey) is not divided into any module.
+table(net$colors)
+```
+##层级聚类树展示各个模块
+```{r}
+# Convert labels to colors for plotting
+moduleLabels = net$colors
+moduleColors = labels2colors(moduleLabels)
+sort(table(moduleColors))
+```
+```{r}
+# Plot the dendrogram and the module colors underneath
+plotDendroAndColors(net$dendrograms[[1]],
+                    moduleColors,
+                    "Module colors",
+                    dendroLabels = FALSE, 
+                    hang = 0.5,
+                    addGuide = TRUE, 
+                    guideHang = 0.05)
+```
+```{r}
+dynamicColors <- labels2colors(net$unmergedColors)
+plotDendroAndColors(net$dendrograms[[1]],
+              cbind(dynamicColors,moduleColors),
+                    c("Dynamic Tree Cut", "Module colors"),
+                    dendroLabels = FALSE, 
+                    hang = 0.5,
+                    addGuide = TRUE, 
+                    guideHang = 0.05)
+
+```
+
+## Co-expression network result output
+
+1. Output the information of the gene and the module in which it is located, which facilitates the enrichment analysis of the module.
+2. The main component information (ME) of the output module, representing the overall gene expression of the module
+Correlation between modules
+```{r}
+### Genes and module information
+gene_module <- data.frame(ID=colnames(dataExpr), module=moduleColors)
+gene_module = gene_module[order(gene_module$module),]
+write.table(gene_module,file=paste0("wgcna.gene_module.xls"),sep="\t",quote=F,row.names=F)
+
+# module eigengene
+MEs = net$MEs
+MEs_col = MEs
+colnames(MEs_col) = paste0("ME", labels2colors(
+  as.numeric(str_replace_all(colnames(MEs),"ME",""))))
+MEs_col = orderMEs(MEs_col)
+
+## Save the representative information of the module
+MEs_colt = as.data.frame(t(MEs_col))
+colnames(MEs_colt) = rownames(dataExpr)
+write.table(MEs_colt,file=paste0("wgcna.sample_module_eipgengene.xls"),sep="\t",quote=F)
+
+# Correlation plot between modules based on the expression of intergene expression
+plotEigengeneNetworks(MEs_colt, 
+                      "Eigengene adjacency dendrogram",
+                      plotHeatmaps = F,
+                      xLabelsAngle = 90)
+```
+```{r}
+plotEigengeneNetworks(MEs_colt, 
+                      "Eigengene adjacency heatmap",
+                      plotDendrograms = F,
+                      marHeatmap = c(8,8,2,2), 
+                      xLabelsAngle = 90)
+```
+##Screening the Hub gene
+```{r}
+hubs = chooseTopHubInEachModule(dataExpr, colorh=moduleColors, power=power, type=type)
+hubs
+```
+## Phenotype association analysis
+```{r}
+if(trait != "") {
+  traitData <- read.table(file=trait, sep='\t', header=T, row.names=1,check.names=FALSE,comment='',quote="")
+  sampleName = rownames(dataExpr)
+  traitData = traitData[match(sampleName, rownames(traitData)), ]
+  traitData<-traitData[,-match("Norm",colnames(traitData))]
+  colnames(traitData)[match("sex",colnames(traitData))]<-"Sex"
+  colnames(traitData)[match("age",colnames(traitData))]<-"Age"
+  # Convert traits to a color representation: white means low, red means high, grey means missing entry
+  traitColors = numbers2colors(traitData, signed = T);
+  # Plot the sample dendrogram and the colors underneath.
+  par(mar=c(5, 4, 4, 2) + 0.1)
+  plotDendroAndColors(sampleTree, 
+                      traitColors,
+                      groupLabels = names(traitData), 
+                      main=NULL
+                      #main = "Sample dendrogram and trait heatmap"
+                      )
+}
+```  
+##If there is phenotype data, you can also put it with ME data and draw a diagram together
+```{r}  
+  MEs_colpheno = orderMEs(cbind(MEs_col, traitData))
+  plotEigengeneNetworks(MEs_colpheno,
+                        "Eigengene and trait adjacency dendrogram", 
+                        plotHeatmaps = F,
+                        xLabelsAngle = 90)
+```
+##Modules associated with phenotype data
+```{r}  
+	if (corType=="pearson") {
+	  modTraitCor = cor(MEs_col, traitData, use = "p")
+	  modTraitP = corPvalueStudent(modTraitCor, nSamples)
+	} else {
+	  modTraitCorP = bicorAndPvalue(MEs_col, 
+	                                traitData,
+	                                robustY=robustY)
+	  modTraitCor = modTraitCorP$bicor
+	  modTraitP   = modTraitCorP$p
+	}
+	# signif indicates numbers of decimals to be retained
+	textMatrix = paste(signif(modTraitCor, 2), "\n(", signif(modTraitP, 1), ")", sep = "")
+	dim(textMatrix) = dim(modTraitCor)
+	for (i in 1:nrow(textMatrix)) {
+	  for(j in 1:ncol(textMatrix))
+	    if(modTraitP[i,j]<0.001)
+	      textMatrix[i,j]<-paste(textMatrix[i,j],"***")
+	    else if(modTraitP[i,j]<0.01)
+	      textMatrix[i,j]<-paste(textMatrix[i,j],"**")
+	    else if(modTraitP[i,j]<0.05)
+	                  textMatrix[i,j]<-
+	        paste(textMatrix[i,j],"*")}
+
+	par(mar = c(6, 10, 4, 6))
+	labeledHeatmap(Matrix = modTraitCor, 
+	               xLabels = colnames(traitData), 
+	               yLabels = colnames(MEs_col), 
+	               ySymbols = colnames(MEs_col),
+	               colors = blueWhiteRed(50), 
+	               textMatrix = textMatrix, 
+	               setStdMargins = FALSE, 
+	               xLabelsAngle = 90,
+	               main=NULL
+	               #main = paste("Module-trait relationships")
+	               )
+```
+```{r}
+modTraitCorP_valid<-matrix(nrow = nrow(modTraitCor),ncol=ncol(modTraitCor))
+for (i in 1:nrow(modTraitCor)) {
+  for(j in 1:ncol(modTraitCor))
+    if(modTraitP[i,j]<0.05) modTraitCorP_valid[i,j]<-modTraitCor[i,j]
+}
+colnames(modTraitCorP_valid)<-colnames(modTraitCor)
+rownames(modTraitCorP_valid)<-rownames(modTraitCor)
+  
+modTraitCorMelt = as.data.frame(modTraitCor)
+
+modTraitCorMelt$ID = rownames(modTraitCor)
+modTraitCorMelt = melt(modTraitCorMelt)
+colnames(modTraitCorMelt) <- c("Module","Trait","PersonCorrelationValue")
+modTraitPMelt = as.data.frame(modTraitP)
+
+modTraitPMelt$ID = rownames(modTraitP)
+modTraitPMelt = melt(modTraitPMelt)
+colnames(modTraitPMelt) <- c("Module","Trait","Pvalue")
+
+modTraitCorP = merge(modTraitCorMelt,
+                     modTraitPMelt,
+                     by=c("Module","Trait"))
+
+```
+## Focus on the association of genes and modules within a module, modules and phenotypes
+### Calculate the correlation matrix of modules and genes
+```{r}
+if (corType=="pearson") {
+  geneModuleMembership = as.data.frame(cor(dataExpr, MEs_col, use = "p"))
+  MMPvalue = as.data.frame(corPvalueStudent(
+             as.matrix(geneModuleMembership), nSamples))
+} else {
+  geneModuleMembershipA =
+    bicorAndPvalue(dataExpr, 
+                   MEs_col,
+                   robustY=robustY)
+  geneModuleMembership =
+    geneModuleMembershipA$bicor
+  MMPvalue = geneModuleMembershipA$p
+}
+geneModuleCorP_valid<-matrix(nrow = nrow(geneModuleMembership),ncol=ncol(geneModuleMembership))
+for (i in 1:nrow(geneModuleMembership)) {
+  for(j in 1:ncol(geneModuleMembership))
+    if(MMPvalue[i,j]<0.05) geneModuleCorP_valid[i,j]<-geneModuleMembership[i,j]
+}
+colnames(geneModuleCorP_valid)<-colnames(geneModuleMembership)
+rownames(geneModuleCorP_valid)<-rownames(geneModuleMembership)
+
+
+
+# Calculate the correlation matrix of traits and genes
+
+## Only continuous traits can be calculated, and in the case of discrete variables, the 0-1 matrix is converted when the sample table is constructed.
+
+if (corType=="pearson") {
+  geneTraitCor = as.data.frame(cor(dataExpr, traitData, use = "p"))
+  geneTraitP = as.data.frame(corPvalueStudent(
+             as.matrix(geneTraitCor), nSamples))
+} else {
+  geneTraitCorA = bicorAndPvalue(dataExpr, 
+                                 traitData, 
+                                 robustY=robustY)
+  geneTraitCor =
+    as.data.frame(geneTraitCorA$bicor)
+  geneTraitP   = as.data.frame(geneTraitCorA$p)
+}
+
+geneTraitCorMelt = as.data.frame(geneTraitCor)
+geneTraitCorMelt$ID = rownames(geneTraitCor)
+geneTraitCorMelt = melt(geneTraitCorMelt)
+colnames(geneTraitCorMelt) <- c("Gene","Trait","PersonCorrelationValue")
+geneTraitPMelt = as.data.frame(geneTraitP)
+geneTraitPMelt$ID = rownames(geneTraitP)
+geneTraitPMelt = melt(geneTraitPMelt)
+colnames(geneTraitPMelt) <- c("Gene","Trait","Pvalue")
+geneTraitCorP = merge(geneTraitCorMelt,
+                      geneTraitPMelt,
+                      by=c("Gene","Trait"))
+
+geneTraitCorColor <- numbers2colors(geneTraitCor)
+
+plotDendroAndColors(net$dendrograms[[1]],
+            cbind(dynamicColors,moduleColors,geneTraitCorColor),
+            c("Dynamic Tree Cut", "Module colors", colnames(geneTraitCor)),
+            dendroLabels = FALSE, 
+            hang = 0.5,
+            addGuide = TRUE, 
+            guideHang = 0.05,
+            main=NULL)
+dev.off()
+
+geneTraitCorP_valid<-matrix(nrow = nrow(geneTraitCor),ncol=ncol(geneTraitCor))
+for (i in 1:nrow(geneTraitCor)) {
+  for(j in 1:ncol(geneTraitCor))
+    if(geneTraitP[i,j]<0.05) geneTraitCorP_valid[i,j]<-geneTraitCor[i,j]
+}
+colnames(geneTraitCorP_valid)<-colnames(geneTraitCor)
+rownames(geneTraitCorP_valid)<-rownames(geneTraitCor)
+
+```
+
+## The module of interest is drawn
+```{r}
+gene_module<-read.table("wgcna.gene_module.xls",sep="\t",header = T)
+```
+
+```{r}
+head_mt<-names(sort(modTraitCorP_valid[modTraitCorP_valid[,"OA"]>0,"OA"],decreasing = T)) 
+head_mt
+if(head_mt[1]=="MEgrey") write.table(gene_module$ID[gene_module$module==sub("ME","",head_mt[2])],"wgcna.pos_module_gene.txt",sep = "\t",row.names = F,col.names = F,quote = F) else write.table(gene_module$ID[gene_module$module==sub("ME","",head_mt[1])],"wgcna.pos_module_gene.txt",sep = "\t",row.names = F,col.names = F,quote = F)
+```
+```{r}
+tail_mt=names(sort(modTraitCorP_valid[modTraitCorP_valid[,"OA"]<0,"OA"],decreasing = F))
+tail_mt
+if(tail_mt[1]=="MEgrey") write.table(gene_module$ID[gene_module$module==sub("ME","",tail_mt[2])],"wgcna.neg_module_gene.txt",sep = "\t",row.names = F,col.names = F,quote = F) else write.table(gene_module$ID[gene_module$module==sub("ME","",tail_mt[1])],"wgcna.neg_module_gene.txt",sep = "\t",row.names = F,col.names = F,quote = F)
+```
+```{r}
+pos<-read.table("wgcna.pos_module_gene.txt",sep = "\t",header = F)
+pos<-data.frame(pos,rep("pos",length(pos)))
+colnames(pos)<-c("symbol","type")
+neg<-read.table("wgcna.neg_module_gene.txt",sep = "\t",header = F)
+neg<-data.frame(neg,rep("neg",length(neg)))
+colnames(neg)<-c("symbol","type")
+symbol_type<-rbind(pos,neg)
+write.table(symbol_type,"wgcna.module_gene_relav.txt",sep = "\t",quote = F,row.names = F,col.names = F)
+```
+
+```{r}
+m<-head_mt
+head_g<-sapply(m,function(x){
+  head(names(sort(geneModuleCorP_valid[geneModuleCorP_valid[,x]>0,x],decreasing = T)),10)
+})
+head_g
+```
+```{r}
+hubs[sub("ME","",head_mt)]
+```
+```{r}
+m<-tail_mt
+tail_g<-sapply(m,function(x){
+  head(names(sort(geneModuleCorP_valid[geneModuleCorP_valid[,x]>0,x],decreasing = T)),10)
+})
+tail_g
+```
+```{r}
+hubs[sub("ME","",tail_mt)]
+```
+##Finally, the two correlation matrices are combined to specify the module of interest for analysis
+```{r}
+module = "blue"
+pheno = "OA"
+modNames = substring(colnames(MEs_col), 3)
+# 获取关注的列
+module_column = match(module, modNames)
+pheno_column = match(pheno,colnames(traitData))
+# 获取模块内的基因
+moduleGenes = moduleColors == module
+
+sizeGrWindow(7, 7)
+par(mfrow = c(1,1))
+# 与性状高度相关的基因，也是与性状相关的模型的关键基因
+verboseScatterplot(geneModuleMembership[moduleGenes, module_column],
+                   geneTraitCor[moduleGenes, pheno_column],
+                   xlab = paste("Module Membership in", module, "module"),
+                   ylab = paste("Gene significance for", pheno),
+                   main = paste("Module membership vs. gene significance\n"),
+                   cex.main = 1.2, 
+                   cex.lab = 1.2, 
+                   cex.axis = 1.2, 
+                   col = module)
+```
+
+
+
+
+
+
